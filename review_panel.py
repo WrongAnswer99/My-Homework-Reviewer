@@ -517,6 +517,9 @@ class ReviewPanel(QWidget):
             self.api_job['cancelled'] = True
             self.api_process.kill()
             return
+        if self.api_context and self.api_context().get('batch_running'):
+            self.statusChanged.emit('请先停止批量调用，再开始纠错 API。', True)
+            return
         item = self.question_list.currentItem()
         if item is None or self.export_dir is None:
             return
@@ -533,6 +536,8 @@ class ReviewPanel(QWidget):
         self._launch_correction_api(request)
 
     def retry_correction_api(self):
+        if self.api_context and self.api_context().get('batch_running'):
+            return
         if (self.api_job is None and self.last_api_request and
                 self.last_api_request['source'] == self.export_dir and
                 self.last_api_request['key'] in self.correction_drafts):
@@ -637,20 +642,22 @@ class ReviewPanel(QWidget):
         self.copy_button.setEnabled(self.detail is not None and self.job is None)
         key = self._current_key()
         occupied = self.api_job is not None and self.api_job['key'] == key
+        batch_running = bool(self.api_context and self.review_api_combo.count()
+                             and self.api_context().get('batch_running'))
         self.correction_note.setEnabled(key is not None)
         self.correction_note.setReadOnly(occupied)
         self.correction_answer.setEnabled(key is not None)
         self.correction_answer.setReadOnly(occupied)
         self.copy_image_button.setEnabled(key is not None)
         self.copy_correction_prompt_button.setEnabled(key is not None)
-        self.review_api_combo.setEnabled(self.api_job is None and bool(self.review_api_combo.count()))
-        self.review_reasoning_combo.setEnabled(self.api_job is None and bool(self.review_reasoning_combo.count()))
-        self.retry_review_reasoning_button.setEnabled(self.api_job is None and
+        self.review_api_combo.setEnabled(not batch_running and self.api_job is None and bool(self.review_api_combo.count()))
+        self.review_reasoning_combo.setEnabled(not batch_running and self.api_job is None and bool(self.review_reasoning_combo.count()))
+        self.retry_review_reasoning_button.setEnabled(not batch_running and self.api_job is None and
             self.review_api_combo.currentData() is not None)
         self.call_correction_api_button.setText('停止请求' if self.api_job else '直接调用 API')
-        self.call_correction_api_button.setEnabled(bool(self.api_job or
+        self.call_correction_api_button.setEnabled(not batch_running and bool(self.api_job or
             (key and self.review_api_combo.currentData() and self.correction_note.text().strip())))
-        self.retry_correction_api_button.setEnabled(bool(not self.api_job and self.last_api_request and
+        self.retry_correction_api_button.setEnabled(bool(not batch_running and not self.api_job and self.last_api_request and
             self.last_api_request['source'] == self.export_dir and
             self.last_api_request['key'] in self.correction_drafts))
 

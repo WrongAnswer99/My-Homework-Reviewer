@@ -264,6 +264,7 @@ class HomeworkWindow(QMainWindow):
         self.unassigned_text = ''
         self.close_requested = False
         self.job = None
+        self.bulk_task = None
         self.last_api_request = None
         self.reasoning_process = None
         self.reasoning_parameter = 'reasoning_effort'
@@ -555,12 +556,25 @@ class HomeworkWindow(QMainWindow):
         self.call_api_button.clicked.connect(self.start_api)
         self.call_api_button.setToolTip('发送当前选中卡片的题目和提示词，完整解答返回后自动整理。')
         api_controls.addWidget(self.call_api_button)
+        self.bulk_api_button = QPushButton('为所有题目依次调用 API')
+        self.bulk_api_button.setStyleSheet('padding: 0 8px; font-size: 13px;')
+        self.bulk_api_button.setToolTip('按当前作业的图片顺序独立请求，已完成整组自动跳过；失败暂停，可继续。')
+        self.bulk_api_button.clicked.connect(self.start_bulk_api)
+        api_controls.addWidget(self.bulk_api_button)
+        api_layout.addLayout(api_controls)
+        retry_controls = QHBoxLayout()
         self.retry_api_button = QPushButton('重试请求')
         self.retry_api_button.clicked.connect(self.retry_api)
         self.retry_api_button.setToolTip('重新发送上次选中卡片的请求，沿用当时的 API 和思考档位。')
-        api_controls.addWidget(self.retry_api_button)
-        api_controls.addStretch()
-        api_layout.addLayout(api_controls)
+        retry_controls.addWidget(self.retry_api_button)
+        retry_controls.addStretch()
+        api_layout.addLayout(retry_controls)
+        self.bulk_label = QLabel('依次处理当前作业；每组成功后立即保存。', objectName='muted')
+        self.bulk_label.setWordWrap(True)
+        api_layout.addWidget(self.bulk_label)
+        self.bulk_progress = QProgressBar()
+        self.bulk_progress.hide()
+        api_layout.addWidget(self.bulk_progress)
 
         reasoning_controls = QHBoxLayout()
         reasoning_controls.addWidget(QLabel('思考强度'))
@@ -621,7 +635,7 @@ class HomeworkWindow(QMainWindow):
         panel.activate()
 
     def _begin_rename(self):
-        if self.source is None or self.job is not None or self.correction_panel.api_job is not None:
+        if self.source is None or self.job is not None or self.correction_panel.api_job is not None or self._bulk_running():
             return
         self.rename_input.setText(self.source.stem)
         self.title_label.hide()
@@ -644,7 +658,7 @@ class HomeworkWindow(QMainWindow):
         return entry.get('source_file') or self.source.name
 
     def _commit_rename(self):
-        if self.source is None or self.job is not None or self.correction_panel.api_job is not None:
+        if self.source is None or self.job is not None or self.correction_panel.api_job is not None or self._bulk_running():
             return
         source = self.source
         base = self.rename_input.text().strip()
@@ -686,7 +700,7 @@ class HomeworkWindow(QMainWindow):
         self._status(f'已重命名为 {target.name}。')
 
     def refresh_files(self):
-        if self.job:
+        if self.job or self._bulk_running():
             return
         self._end_rename()
         previous = str(self.source) if self.source else self.state.get('selected_source')
@@ -722,6 +736,9 @@ class HomeworkWindow(QMainWindow):
             self.refresh_files()
 
     def _select_file(self, item, previous=None):
+        self.bulk_task = None
+        self.bulk_progress.hide()
+        self.bulk_label.setText('依次处理当前作业；每组成功后立即保存。')
         self._end_rename()
         self.save_state()
         self.answer_timer.stop()
@@ -839,7 +856,9 @@ class HomeworkWindow(QMainWindow):
         self._queue_save()
 
     def _update_buttons(self):
-        idle, selected = self.job is None and self.correction_panel.api_job is None, self.source is not None
+        bulk_running = self._bulk_running()
+        idle = self.job is None and self.correction_panel.api_job is None and not bulk_running
+        selected = self.source is not None
         for widget in (self.refresh_button, self.folder_button, self.file_list):
             widget.setEnabled(idle)
         self.convert_button.setEnabled(idle and selected)
@@ -857,25 +876,30 @@ class HomeworkWindow(QMainWindow):
         api_running = self.job is not None and self.job['kind'] == 'api'
         self.prompt.setEnabled(selected)
         self.prompt.setReadOnly(api_running and self.current_card_key == self.job['card_key'])
-        self.cards.setEnabled(idle or api_running)
+        self.cards.setEnabled(idle or api_running or bulk_running)
         has_prompt = self.prompt_template_combo.currentData() is not None
         self.copy_prompt_button.setEnabled(idle and has_prompt and self.export_dir is not None and self.cards.currentItem() is not None)
         self.prompt_template_combo.setEnabled(idle and bool(self.prompt_templates))
         self.prompt_settings_button.setEnabled(idle)
         self.open_study_button.setEnabled(idle and self.study_path is not None and self.study_path.is_file())
-        self.api_config_button.setEnabled(not api_running)
+        self.api_config_button.setEnabled(not api_running and not bulk_running)
         self.api_combo.setEnabled(idle and bool(self.api_profiles))
         self.reasoning_combo.setEnabled(idle and bool(self.api_profiles))
         self.retry_reasoning_button.setEnabled(idle and self.api_combo.currentData() is not None)
         self.call_api_button.setText('停止请求' if api_running else '直接调用 API')
-        self.call_api_button.setEnabled(api_running or (idle and self.export_dir is not None
+        self.call_api_button.setEnabled(not bulk_running and (api_running or (idle and self.export_dir is not None
                                         and self.cards.currentItem() is not None
-                                        and self.api_combo.currentData() is not None and has_prompt))
+                                        and self.api_combo.currentData() is not None and has_prompt)))
+        self.bulk_api_button.setText('停止批量调用' if bulk_running else
+                                    '继续批量调用' if self.bulk_task else '为所有题目依次调用 API')
+        self.bulk_api_button.setEnabled(bulk_running or (idle and selected and has_prompt
+                                         and self.api_combo.currentData() is not None))
         previous = self.last_api_request
         self.retry_api_button.setEnabled(bool(idle and previous and self.export_dir == previous['export_dir']
                                                and Path(previous['image']).is_file()
                                                and self._request_card_index(previous) >= 0
                                                and any(p['id'] == previous['profile'] for p in self.api_profiles)))
+        self.correction_panel._buttons()
 
     def _refresh_api_profiles(self):
         selected = self.api_combo.currentData() or self.state.get('selected_api')
@@ -905,7 +929,8 @@ class HomeworkWindow(QMainWindow):
                 'efforts': [(self.reasoning_combo.itemText(i), self.reasoning_combo.itemData(i))
                             for i in range(self.reasoning_combo.count())],
                 'effort': self.reasoning_combo.currentData(),
-                'parameter': self.reasoning_parameter, 'config': self.api_config_path}
+                'parameter': self.reasoning_parameter, 'config': self.api_config_path,
+                'batch_running': self._bulk_running() or bool(self.job and self.job.get('bulk_position') is not None)}
 
     def _api_selection_changed(self, *args):
         self.reasoning_combo.setCurrentIndex(0)
@@ -1039,7 +1064,131 @@ class HomeworkWindow(QMainWindow):
             temporary.write(text)
         return Path(temporary.name)
 
+    def _bulk_running(self):
+        return bool(self.bulk_task and self.bulk_task['running'])
+
+    def _bulk_message(self, note):
+        task = self.bulk_task
+        if task is None:
+            return
+        task['note'] = note
+        plan = task.get('plan')
+        self.bulk_progress.show()
+        if plan:
+            total = len(plan['cards'])
+            self.bulk_progress.setTextVisible(True)
+            self.bulk_progress.setRange(0, total)
+            self.bulk_progress.setValue(task['position'])
+            self.bulk_progress.setFormat('已处理 %v / %m 组')
+            done = len(set(plan['answered']) | self.answered)
+            self.bulk_label.setText(f'{note}\n已解答 {done}/{plan["question_count"]} 题'
+                                    f' · 已跳过 {task["skipped"]} 组')
+        else:
+            self.bulk_progress.setTextVisible(not task['running'])
+            self.bulk_progress.setRange(0, 0 if task['running'] else 1)
+            if not task['running']:
+                self.bulk_progress.setValue(0)
+                self.bulk_progress.setFormat('已暂停')
+            self.bulk_label.setText(note)
+
+    def _pause_bulk(self, reason):
+        if self.bulk_task:
+            self.bulk_task['running'] = False
+            self._bulk_message('批量已暂停：'+reason)
+            self._update_buttons()
+
+    def start_bulk_api(self):
+        if self._bulk_running():
+            self._pause_bulk('已停止；再次点击可从未完成处继续。')
+            if self.job and self.job['kind'] == 'api':
+                self.job['cancelled'] = True
+                self.process.kill()
+            return
+        if self.job or self.source is None or self.correction_panel.api_job is not None:
+            return
+        try:
+            profile = next((p for p in load_profiles(self.api_config_path)
+                            if p['id'] == self.api_combo.currentData()), None)
+            if profile is None:
+                raise ValueError('请先添加并选择 API 配置')
+            profile = normalize_profile(profile, require_ready=True)
+            base_request = {'profile': profile['id'], 'profile_snapshot': profile,
+                            'reasoning_effort': self.reasoning_combo.currentData(),
+                            'reasoning_parameter': self.reasoning_parameter,
+                            'prompt_text': self._selected_prompt_text()}
+        except (OSError, ValueError, TypeError) as exc:
+            self._status(f'无法开始批量调用：{exc}', True)
+            return
+        task = self.bulk_task
+        same_work = bool(task and task['source'] == self.source and
+                         task['export_dir'] == self.export_dir and task['render_dir'] == self.render_dir)
+        if same_work:
+            task.update(running=True, position=0, skipped=0, phase='prepare', base_request=base_request)
+        else:
+            self.bulk_task = {'source': self.source, 'export_dir': self.export_dir,
+                              'render_dir': self.render_dir, 'running': True, 'phase': 'prepare',
+                              'position': 0, 'skipped': 0, 'plan': None, 'pending_result': None,
+                              'base_request': base_request}
+        self._bulk_message('正在准备当前作业的全部题目…')
+        self._update_buttons()
+        QTimer.singleShot(0, self._advance_bulk)
+
+    def _advance_bulk(self):
+        if not self._bulk_running() or self.job or self.correction_panel.api_job is not None:
+            return
+        task = self.bulk_task
+        if self.source != task['source']:
+            self._pause_bulk('当前作业已改变，请重新开始。')
+            return
+        self._drain_pending_merges()
+        if self.job:
+            return
+        pending = task.get('pending_result')
+        if pending:
+            self._bulk_message('正在保存已返回的答案…')
+            if not self._start_merge_text(pending['text'], pending['source'], api_result=True,
+                                          exclude_orders=pending['keep_orders'], bulk_position=pending['position']):
+                self._pause_bulk('无法保存已返回答案；继续时会先重试保存。')
+            return
+        if self.export_dir is None:
+            self._bulk_message('正在自动转换 Markdown…')
+            self.start_convert()
+        elif not self.cards.count():
+            self._bulk_message('正在按当前设置自动生成图片…')
+            self.start_render()
+        elif task['phase'] == 'dispatch':
+            plan = task['plan']
+            while task['position'] < len(plan['cards']):
+                card = plan['cards'][task['position']]
+                if card['complete']:
+                    task['position'] += 1
+                    task['skipped'] += 1
+                    continue
+                request = dict(task['base_request'], export_dir=self.export_dir,
+                               first=card['first'], last=card['last'], image=card['image'],
+                               bulk_position=task['position'], keep_orders=card['keep_orders'])
+                task['phase'] = 'api'
+                self._bulk_message(f'正在处理第 {card["first"]}–{card["last"]} 题…')
+                if not self._launch_api(request):
+                    self._pause_bulk('请求未能启动，请查看底部状态。')
+                return
+            total = len(plan['cards'])
+            skipped = task['skipped']
+            self.bulk_task = None
+            self.bulk_progress.setRange(0, total)
+            self.bulk_progress.setValue(total)
+            self.bulk_label.setText(f'批量完成 · {total} 组 · 跳过已有答案 {skipped} 组')
+            self._status('本份作业的全部题目已处理完成。')
+            self._update_buttons()
+        else:
+            task['export_dir'], task['render_dir'] = self.export_dir, self.render_dir
+            self._bulk_message('正在检查已保存答案和图片顺序…')
+            self._start_job({'kind': 'batch_plan'}, 'batch_homework.py',
+                            [self.export_dir, '--manifest', self.render_dir/'manifest.json'])
+
     def start_api(self):
+        if self._bulk_running():
+            return
         if self.job:
             if self.job['kind'] == 'api':
                 self.job['cancelled'] = True
@@ -1062,6 +1211,8 @@ class HomeworkWindow(QMainWindow):
         self._launch_api(request)
 
     def retry_api(self):
+        if self._bulk_running():
+            return
         request = self.last_api_request
         if self.job is None and request is not None and self.export_dir == request['export_dir']:
             index = self._request_card_index(request)
@@ -1084,38 +1235,48 @@ class HomeworkWindow(QMainWindow):
         return -1
 
     def _launch_api(self, request):
+        config_input = None
         try:
-            profiles = load_profiles(self.api_config_path)
-            profile = next((p for p in profiles if p['id'] == request['profile']), None)
+            profile = request.get('profile_snapshot')
+            if profile is None:
+                profiles = load_profiles(self.api_config_path)
+                profile = next((p for p in profiles if p['id'] == request['profile']), None)
             if profile is None:
                 raise ValueError('请先添加并选择 API 配置')
-            normalize_profile(profile, require_ready=True)
+            profile = normalize_profile(profile, require_ready=True)
             if not Path(request['image']).is_file():
                 raise ValueError('题目图片不存在，请重新生成后再发送')
             request = request.copy()
             if 'prompt_text' not in request:
                 request['prompt_text'] = self._selected_prompt_text()
+            if request.get('profile_snapshot'):
+                config_input = self._snapshot_prompt(json.dumps({'version': 1, 'profiles': [profile]}, ensure_ascii=False))
             prompt_input = self._snapshot_prompt(request['prompt_text'])
         except (OSError, ValueError, TypeError) as exc:
+            if config_input:
+                config_input.unlink(missing_ok=True)
             self._status(f'API 配置无效：{exc}', True)
-            return
+            return False
         self.last_api_request = request.copy()
         self._stash_prompt()
         self.answer_timer.stop()
         self.save_timer.stop()
-        job = {'kind': 'api', 'input': prompt_input, 'previous_text': self.prompt.toPlainText(),
-               'card_key': f'{request["first"]}-{request["last"]}',
+        card_key = f'{request["first"]}-{request["last"]}'
+        job = {'kind': 'api', 'input': prompt_input, 'config_input': config_input,
+               'previous_text': self.card_texts.get(card_key, ''), 'card_key': card_key,
                'first': request['first'], 'last': request['last'],
                'export_dir': request['export_dir'],
+               'bulk_position': request.get('bulk_position'), 'keep_orders': request.get('keep_orders', []),
                'text': '', 'result': None, 'error': '', 'cancelled': False}
         self.answer_dirty = False
-        args = [request['export_dir'], '--config', self.api_config_path,
+        args = [request['export_dir'], '--config', config_input or self.api_config_path,
                 '--profile', request['profile'], '--first', request['first'], '--last', request['last'],
                 '--image', request['image'], '--prompt-file', prompt_input]
         if request['reasoning_effort'] is not None:
             args += ['--reasoning-effort', request['reasoning_effort'],
                      '--reasoning-parameter', request['reasoning_parameter']]
         self._start_job(job, 'api_homework.py', args)
+        return True
 
     def _api_event(self, event):
         if not isinstance(event, dict) or not self.job or self.job['kind'] != 'api':
@@ -1148,11 +1309,25 @@ class HomeworkWindow(QMainWindow):
         else:
             reason = job['error'] or (result.get('message') if result else None) or '请求进程未正常完成'
             self._status(f'API 调用未导入：{reason[:240]}', True)
+        bulk = job.get('bulk_position') is not None and self.bulk_task is not None
+        if bulk:
+            if valid:
+                self.bulk_task['pending_result'] = {'text': final_text, 'source': job['export_dir'],
+                                                    'keep_orders': job['keep_orders'],
+                                                    'position': job['bulk_position']}
+            else:
+                self._pause_bulk('当前组未完成，保留已保存结果；点击继续重试当前组。')
         self._update_buttons()
         self.save_state()
         if valid:
-            self._start_merge_text(final_text, job['export_dir'], api_result=True)
+            started = self._start_merge_text(final_text, job['export_dir'], api_result=True,
+                                              exclude_orders=job.get('keep_orders'),
+                                              bulk_position=job.get('bulk_position'))
+            if bulk and not started:
+                self._pause_bulk('无法保存已返回答案；继续时会先重试保存。')
         self._drain_pending_merges()
+        if self._bulk_running() and self.job is None:
+            QTimer.singleShot(0, self._advance_bulk)
         if self.close_requested and self.job is None:
             self.close_requested = False
             self.close()
@@ -1256,19 +1431,24 @@ class HomeworkWindow(QMainWindow):
             return
         self._start_merge_text(text, self.export_dir, exclude_range=self.api_protected_range)
 
-    def _start_merge_text(self, text, source, exclude_range=None, api_result=False):
+    def _start_merge_text(self, text, source, exclude_range=None, api_result=False,
+                          exclude_orders=None, bulk_position=None):
         input_path = PROJECT/'data'/('answer-input-'+uuid.uuid4().hex+'.md')
         try:
             input_path.parent.mkdir(parents=True, exist_ok=True)
             input_path.write_text(text, encoding='utf-8')
         except OSError as exc:
             self._status(f'保存回复失败：{exc}', True)
-            return
+            return False
         arguments = ['merge', source, '--input', input_path]
         if exclude_range is not None:
             arguments += ['--exclude-range', *exclude_range]
-        self._start_job({'kind': 'merge', 'input': input_path, 'api_result': api_result},
+        if exclude_orders:
+            arguments += ['--exclude-orders', *exclude_orders]
+        self._start_job({'kind': 'merge', 'input': input_path, 'api_result': api_result,
+                         'bulk_position': bulk_position},
                         'answers_homework.py', arguments)
+        return True
 
     def _drain_pending_merges(self):
         if self.job is not None:
@@ -1328,6 +1508,7 @@ class HomeworkWindow(QMainWindow):
         self._update_buttons()
         self._status({'convert': '正在转换为 Markdown…', 'render': '正在排版并生成图片…',
                       'prompt': '正在生成当前卡片的提示词…', 'merge': '正在按题目整理解答…',
+                      'batch_plan': '正在检查全部题目和已保存答案…',
                       'api': '正在调用所选 API 解答当前卡片…'}[job['kind']])
         self.process.start()
 
@@ -1380,8 +1561,9 @@ class HomeworkWindow(QMainWindow):
             return
         self._read_output()
         job, self.job = self.job, None
-        if job.get('input'):
-            job['input'].unlink(missing_ok=True)
+        for temporary in (job.get('input'), job.get('config_input')):
+            if temporary:
+                temporary.unlink(missing_ok=True)
         self.progress.hide()
         success = code == 0 and exit_status == QProcess.ExitStatus.NormalExit
         if job['kind'] == 'api':
@@ -1401,6 +1583,16 @@ class HomeworkWindow(QMainWindow):
                 success = self.render_dir == job['target']
                 if success:
                     self._status(f'已生成 {self.cards.count()} 张图片，点击缩略图即可复制。')
+            elif job['kind'] == 'batch_plan':
+                try:
+                    plan = json.loads(self.log.decode('utf-8'))
+                    if not isinstance(plan.get('cards'), list) or not plan['cards']:
+                        raise ValueError('未找到有效的图片调用计划')
+                    if self.bulk_task:
+                        self.bulk_task.update(plan=plan, phase='dispatch')
+                except (ValueError, KeyError, TypeError) as exc:
+                    self.log += f'\n失败：{exc}'.encode('utf-8')
+                    success = False
             else:
                 try:
                     result = json.loads(self.log.decode('utf-8'))
@@ -1424,11 +1616,22 @@ class HomeworkWindow(QMainWindow):
                     self.log += f'\n失败：无法读取 CLI 结果：{exc}'.encode('utf-8')
                     success = False
         if not success:
-            action = {'convert': '转换', 'render': '生成图片', 'prompt': '复制提示词', 'merge': '整理解答'}[job['kind']]
+            action = {'convert': '转换', 'render': '生成图片', 'prompt': '复制提示词',
+                      'merge': '整理解答', 'batch_plan': '检查批量任务'}[job['kind']]
             lines = self.log.decode('utf-8', errors='replace').strip().splitlines()
             reason = next((line.split('失败：', 1)[-1] for line in reversed(lines) if '失败：' in line),
                           lines[-1] if lines else '未生成预期结果')
             self._status(f'{action}失败：{reason[:160]}。可查看运行日志。', True)
+        if self.bulk_task:
+            if success and job['kind'] in {'convert', 'render'}:
+                self.bulk_task.update(export_dir=self.export_dir, render_dir=self.render_dir)
+            if success and job['kind'] == 'merge' and job.get('bulk_position') is not None:
+                self.bulk_task.update(pending_result=None, phase='prepare', position=job['bulk_position']+1)
+                self._bulk_message('当前组已保存，准备下一组…' if self._bulk_running() else '已暂停 · 当前组已保存。')
+            elif success and job['kind'] == 'merge':
+                self.bulk_task['phase'] = 'prepare'
+            if not success:
+                self._pause_bulk('当前步骤失败，请查看底部状态；继续时从未完成处重试。')
         if job.get('api_result') and not success:
             self.api_protected_range = None
         self._update_buttons()
@@ -1436,6 +1639,8 @@ class HomeworkWindow(QMainWindow):
         # An edit may arrive while a CLI is running. Always process the latest
         # text after it finishes, rather than losing that queued paste.
         self._drain_pending_merges()
+        if self._bulk_running() and self.job is None:
+            QTimer.singleShot(0, self._advance_bulk)
         if self.close_requested and self.job is None:
             self.close_requested = False
             self.close()
@@ -1512,6 +1717,8 @@ class HomeworkWindow(QMainWindow):
                 temporary.unlink()
 
     def closeEvent(self, event):
+        if self._bulk_running():
+            self._pause_bulk('窗口即将关闭，完成当前步骤后停止；下次可跳过已完成的组。')
         self.answer_timer.stop()
         if self.answer_dirty:
             self.start_merge()

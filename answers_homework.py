@@ -188,18 +188,22 @@ def atomic_write(path, content):
         temporary.unlink(missing_ok=True)
 
 
-def merge_answers(source, text, exclude_range=None):
+def merge_answers(source, text, exclude_range=None, exclude_orders=None):
     source, report, rows, document_id = load_questions(source)
     keys = {row['key'] for row in rows}
     incoming = parse_answers(text, keys)
-    skipped_protected = False
+    protected = set()
     if exclude_range is not None:
         first, last = exclude_range
         if not 1 <= first <= last <= len(rows):
             raise ValueError('受保护的题目范围无效')
-        protected = {row['key'] for row in rows[first-1:last]}
-        skipped_protected = bool(incoming.keys() & protected)
-        incoming = {key: answer for key, answer in incoming.items() if key not in protected}
+        protected.update(row['key'] for row in rows[first-1:last])
+    if exclude_orders is not None:
+        if any(type(order) is not int or not 1 <= order <= len(rows) for order in exclude_orders):
+            raise ValueError('受保护的题号无效')
+        protected.update(rows[order-1]['key'] for order in exclude_orders)
+    skipped_protected = bool(incoming.keys() & protected)
+    incoming = {key: answer for key, answer in incoming.items() if key not in protected}
     store = load_store(source.parent, document_id, keys)
     if incoming:
         store['answers'].update(incoming)
@@ -229,6 +233,7 @@ def main():
     merge.add_argument('--input', type=Path, required=True, help='UTF-8 Markdown 回复文件')
     merge.add_argument('--exclude-range', type=int, nargs=2, metavar=('FIRST', 'LAST'),
                        help='合并其他题组时跳过正在由 API 解答的题号范围')
+    merge.add_argument('--exclude-orders', type=int, nargs='+', help='保留这些题号的已有答案')
     args = parser.parse_args()
     try:
         if args.command == 'prompt':
@@ -236,7 +241,7 @@ def main():
             print(json.dumps({'prompt': value}, ensure_ascii=False) if args.json else value)
         else:
             print(json.dumps(merge_answers(args.source, args.input.read_text(encoding='utf-8-sig'),
-                                           args.exclude_range),
+                                           args.exclude_range, args.exclude_orders),
                              ensure_ascii=False))
         return 0
     except (OSError, ValueError, KeyError, TypeError) as exc:
