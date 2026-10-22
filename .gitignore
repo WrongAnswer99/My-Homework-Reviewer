@@ -1,0 +1,56 @@
+# Python bytecode and tool caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.tox/
+.nox/
+
+# Virtual environments and packaging output
+.venv/
+venv/
+env/
+ENV/
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Local credentials (keep shareable environment examples)
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Application credentials, UI state, and temporary answer drafts
+/data/api_config.json
+/data/gui_state.json
+/data/sdk_packages/
+/data/.api-config-*.tmp
+/data/.prompt-config-*.tmp
+/data/answer-input-*.md
+
+# Generated exports and private browser archives
+/exports/
+*.mhtml
+*.mht
+
+# Local editor settings and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Logs and editor temporary files
+*.log
+*.tmp
+*.swp
+*.swo
+*~

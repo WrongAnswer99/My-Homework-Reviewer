@@ -1,0 +1,6 @@
+fonttools>=4.40,<5
+Pillow>=10,<13
+Markdown>=3.5,<4
+playwright>=1.40,<2
+PySide6>=6.6,<7
+openai>=2,<3
