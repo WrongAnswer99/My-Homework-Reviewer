@@ -392,7 +392,8 @@ def _extract(source: Path, output: Path, resolver, progress=None):
             option_list = node.find_class('Zy_ulTop')
             if modern_title is not None:
                 for choice in (n for n in node.walk() if n.has_class('answerBg')):
-                    label = choice.find_class('num_option')
+                    label = next((n for n in choice.walk() if n.has_class('num_option')
+                                  or n.has_class('num_option_dx')), None)
                     body = choice.find_class('answer_p')
                     if label is not None and body is not None:
                         option_nodes.append((clean(label.text()), body, False))

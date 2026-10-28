@@ -42,6 +42,64 @@ def question(stem, options=''):
 
 
 class ExtractionTests(unittest.TestCase):
+    def test_new_homework_editor_choice_labels_and_content(self):
+        for qtype, label_class, role in [('单选题', 'num_option', 'radio'),
+                                         ('多选题', 'num_option_dx', 'checkbox')]:
+            with self.subTest(qtype=qtype), tempfile.TemporaryDirectory(dir=ROOT) as temp:
+                source, output = Path(temp)/'test.mhtml', Path(temp)/'result'
+                html = f'''<h2 class="mark_title">测试作业</h2>
+                <div class="questionLi singleQuesId" typename="{qtype}" data="q1"
+                     aria-label="题目 9. ">
+                  <h3 class="mark_name">9.<span class="colorShallow">({qtype}, 5分)</span>
+                    <p>选择正确的表达式。</p></h3>
+                  <div class="stem_answer">
+                    <div class="answerBg" role="{role}" aria-checked="true" aria-label="D 选择">
+                      <span class="{label_class} check_answer_dx" data="D">A</span>
+                      <div class="answer_p"><p>逻辑变量 x<sub>1</sub></p></div>
+                    </div>
+                    <div class="answerBg" role="{role}" aria-label="A 选择">
+                      <span class="{label_class}" data="A">B</span>
+                      <div class="answer_p"><img src="cid:formula"></div>
+                    </div>
+                  </div>
+                  <input type="hidden" name="answer" value="D">
+                </div>'''
+                archive(source, html, [('formula', 'image/png', b'formula-image')])
+                report = extract(source, output, resolver=SimpleNamespace(model='unused', question_count=0))
+                q = report['assignments'][0]['questions'][0]
+                self.assertEqual(q['number'], '9')
+                self.assertEqual(q['type'], qtype)
+                self.assertEqual(q['stem'], '选择正确的表达式。')
+                self.assertEqual([o['label'] for o in q['options']], ['A', 'B'])
+                self.assertEqual(q['options'][0]['text'], '逻辑变量 x<sub>1</sub>')
+                self.assertIn('![题图](images/', q['options'][1]['text'])
+                self.assertEqual(report['image_count'], 1)
+                markdown = (output/'questions.md').read_text(encoding='utf-8')
+                self.assertIn('- **A.** 逻辑变量 x<sub>1</sub>', markdown)
+                self.assertIn('- **B.** ![题图](images/', markdown)
+                self.assertNotIn('aria-checked', markdown)
+                self.assertNotIn('answer', q)
+
+    def test_new_homework_editor_real_multiple_choice_questions(self):
+        source = ROOT/'数电第二章1.mhtml'
+        if not source.exists():
+            self.skipTest('新版多选题样例归档未提供')
+        with tempfile.TemporaryDirectory(dir=ROOT) as temp:
+            output = Path(temp)/'result'
+            report = extract(source, output, resolver=SimpleNamespace(model='unused', question_count=0))
+            questions = report['assignments'][0]['questions']
+            self.assertEqual(report['question_count'], 17)
+            self.assertEqual([q['type'] for q in questions],
+                             ['单选题']*8 + ['多选题']*3 + ['填空题']*3 + ['计算题']*3)
+            self.assertTrue(all([o['label'] for o in q['options']] == list('ABCD')
+                                for q in questions[:11]))
+            self.assertTrue(all(not q['options'] for q in questions[11:]))
+            self.assertEqual([o['text'] for o in questions[8]['options']],
+                             ['开关的闭合、断开', '电位的高、低', '真与假', '电流的有、无'])
+            self.assertEqual([o['text'] for o in questions[10]['options']],
+                             ['真值表', '表达式', '逻辑图', '卡诺图'])
+            self.assertEqual(report['warnings'], [])
+
     def test_new_homework_editor_extracts_questions_without_student_answers(self):
         source = ROOT/'数电第二章2.mhtml'
         if not source.exists():
