@@ -9,9 +9,9 @@ from pathlib import Path
 from PySide6.QtCore import QProcess, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QImage
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit,
+    QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QListView, QListWidget, QListWidgetItem, QPlainTextEdit, QPushButton,
-    QSizePolicy, QSplitter, QVBoxLayout, QWidget,
+    QProgressBar, QSizePolicy, QSplitter, QVBoxLayout, QWidget,
 )
 
 from markdown_preview import MarkdownPreview
@@ -28,6 +28,15 @@ class ElidedLabel(QLabel):
         super().resizeEvent(event)
         self.setText(self.fontMetrics().elidedText(
             self.full_text, Qt.TextElideMode.ElideRight, max(0, self.contentsRect().width())))
+
+
+class CorrectionNoteEdit(QPlainTextEdit):
+    """Multiline Markdown feedback, with the former editor's text accessors."""
+    def text(self):
+        return self.toPlainText()
+
+    def setText(self, text):
+        self.setPlainText(text)
 
 
 class ReviewPanel(QWidget):
@@ -54,6 +63,8 @@ class ReviewPanel(QWidget):
         self.correction_dirty = set()
         self.correction_loading = False
         self.api_job = None
+        self.correction_batch = None
+        self.import_pending = False
         self.last_api_request = None
         self.api_raw = b''
         self.api_pending = b''
@@ -77,6 +88,18 @@ class ReviewPanel(QWidget):
     def _build(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 12, 0, 0)
+        automatic = QWidget()
+        automatic_layout = QHBoxLayout(automatic)
+        automatic_layout.setContentsMargins(0, 0, 0, 6)
+        automatic_layout.addWidget(QLabel('自动纠错：', objectName='section'))
+        self.result_path = QLineEdit()
+        self.result_path.setPlaceholderText('输入已批阅结果文档路径；留空时选择文件')
+        automatic_layout.addWidget(self.result_path, 1)
+        self.import_results_button = QPushButton('打开结果文档并纠错')
+        self.import_results_button.clicked.connect(self.import_official_results)
+        automatic_layout.addWidget(self.import_results_button)
+        layout.addWidget(automatic)
+        automatic.setVisible(self.mode == 'correction')
         splitter = QSplitter(Qt.Orientation.Horizontal)
         left = QWidget()
         left.setMinimumWidth(200)
@@ -114,7 +137,9 @@ class ReviewPanel(QWidget):
         correction_layout.setContentsMargins(12, 10, 12, 10)
         correction_layout.setSpacing(7)
         correction_layout.addWidget(QLabel('答案纠错与补充', objectName='section'))
-        self.correction_note = QLineEdit()
+        self.correction_note = CorrectionNoteEdit()
+        self.correction_note.setMaximumHeight(105)
+        self.correction_note.setMinimumHeight(65)
         self.correction_note.setPlaceholderText('输入官方答案、官方解析及需要补充的纠错信息')
         self.correction_note.textChanged.connect(self._correction_changed)
         correction_layout.addWidget(self.correction_note)
@@ -136,34 +161,63 @@ class ReviewPanel(QWidget):
         self.correction_answer.textChanged.connect(self._correction_changed)
         manual_layout.addWidget(self.correction_answer, 1)
         correction_splitter.addWidget(manual)
-        api = QWidget()
+        api = QFrame()
+        api.setObjectName('settings')
         api_layout = QVBoxLayout(api)
-        api_layout.setContentsMargins(8, 0, 0, 0)
-        api_layout.setSpacing(5)
+        api_layout.setContentsMargins(16, 14, 16, 14)
+        api_layout.setSpacing(8)
         api_layout.addWidget(QLabel('使用 API', objectName='section'))
+        api_layout.addWidget(QLabel('模型'))
         self.review_api_combo = QComboBox()
         self.review_api_combo.setView(QListView())
+        self.review_api_combo.setMinimumWidth(160)
+        self.review_api_combo.setMinimumContentsLength(12)
+        self.review_api_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.review_api_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.review_api_combo.currentIndexChanged.connect(self._review_profile_changed)
         api_layout.addWidget(self.review_api_combo)
-        self.review_reasoning_combo = QComboBox()
-        self.review_reasoning_combo.setView(QListView())
-        self.review_reasoning_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        api_layout.addWidget(QLabel('思考强度'))
-        api_layout.addWidget(self.review_reasoning_combo)
-        self.retry_review_reasoning_button = QPushButton('重试获取思考强度')
-        self.retry_review_reasoning_button.clicked.connect(self.reasoningRequested.emit)
-        self.retry_review_reasoning_button.setToolTip('目录缺少档位时发送一次最小测试请求；'
-                                                     '不发送题目，可能产生少量 API 费用。')
-        api_layout.addWidget(self.retry_review_reasoning_button)
+        api_controls = QHBoxLayout()
         self.call_correction_api_button = QPushButton('直接调用 API')
         self.call_correction_api_button.clicked.connect(self.start_correction_api)
-        api_layout.addWidget(self.call_correction_api_button)
+        api_controls.addWidget(self.call_correction_api_button)
+        self.bulk_correction_api_button = QPushButton('为所有需要修改的题依次调用API')
+        self.bulk_correction_api_button.setStyleSheet('padding: 0 8px; font-size: 13px;')
+        self.bulk_correction_api_button.clicked.connect(self.start_bulk_correction_api)
+        api_controls.addWidget(self.bulk_correction_api_button)
+        api_layout.addLayout(api_controls)
+        retry_controls = QHBoxLayout()
         self.retry_correction_api_button = QPushButton('重试请求')
         self.retry_correction_api_button.clicked.connect(self.retry_correction_api)
-        api_layout.addWidget(self.retry_correction_api_button)
+        retry_controls.addWidget(self.retry_correction_api_button)
+        retry_controls.addStretch()
+        api_layout.addLayout(retry_controls)
+        self.correction_bulk_label = QLabel('依次处理有纠错建议的题目；每题成功后立即保存。', objectName='muted')
+        self.correction_bulk_label.setWordWrap(True)
+        api_layout.addWidget(self.correction_bulk_label)
+        self.correction_bulk_progress = QProgressBar()
+        self.correction_bulk_progress.hide()
+        api_layout.addWidget(self.correction_bulk_progress)
+        reasoning_controls = QHBoxLayout()
+        reasoning_controls.addWidget(QLabel('思考强度'))
+        reasoning_controls.addStretch()
+        self.review_reasoning_hint = QLabel('档位待查询', objectName='muted')
+        reasoning_controls.addWidget(self.review_reasoning_hint)
+        api_layout.addLayout(reasoning_controls)
+        reasoning_actions = QHBoxLayout()
+        self.review_reasoning_combo = QComboBox()
+        self.review_reasoning_combo.setView(QListView())
+        self.review_reasoning_combo.setMinimumWidth(112)
+        self.review_reasoning_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        reasoning_actions.addWidget(self.review_reasoning_combo, 1)
+        self.retry_review_reasoning_button = QPushButton('重试获取思考强度')
+        self.retry_review_reasoning_button.clicked.connect(self.reasoningRequested.emit)
+        self.retry_review_reasoning_button.setToolTip('重新查询模型目录；缺少档位时发送一次最小测试请求。'
+                                                     '不发送题目，可能产生少量 API 费用。')
+        reasoning_actions.addWidget(self.retry_review_reasoning_button)
+        api_layout.addLayout(reasoning_actions)
+        api_layout.addStretch()
         correction_splitter.addWidget(api)
-        correction_splitter.setSizes([480, 240])
+        correction_splitter.setSizes([400, 520])
         correction_splitter.setStretchFactor(0, 1)
         correction_layout.addWidget(correction_splitter)
         right_layout.addWidget(correction)
@@ -205,6 +259,9 @@ class ReviewPanel(QWidget):
         if directory == self.export_dir and not refresh:
             return
         self._save_dirty()
+        if directory != self.export_dir:
+            self.correction_batch = None
+            self.last_api_request = None
         pending_saves = [job for job in self.queue if job['kind'] == 'save']
         self.generation += 1
         self.export_dir = directory
@@ -246,7 +303,7 @@ class ReviewPanel(QWidget):
             return
         self.job = self.queue.pop(0)
         self.raw = b''
-        correction = self.job['kind'] in {'save', 'prompt', 'image'}
+        correction = self.job['kind'] in {'save', 'prompt', 'image', 'import', 'plan'}
         args = [self.job['kind'], self.job['source']]
         if self.job['order'] is not None:
             args += ['--order', self.job['order']]
@@ -283,7 +340,20 @@ class ReviewPanel(QWidget):
                 result = json.loads(self.raw.decode('utf-8'))
                 if code or status != QProcess.ExitStatus.NormalExit:
                     raise ValueError(result.get('message', 'CLI 执行失败'))
-                if job['kind'] == 'list':
+                if job['kind'] == 'import':
+                    self.correction_batch = None
+                    for entry in result['notes']:
+                        self.correction_drafts[entry['key']] = {'note': entry['note'], 'answer': entry['answer']}
+                    self._load_correction(self._current_key())
+                    self._render_detail()
+                    self.statusChanged.emit(f'已导入 {result["imported"]} 道错题的官方建议'
+                                            f'（答对 {result["correct"]} 题），未调用 AI。', False)
+                elif job['kind'] == 'plan':
+                    if self.correction_batch and self.correction_batch['running']:
+                        self.correction_batch['items'] = result['questions']
+                        self.correction_batch['planning'] = False
+                        self._next_correction_batch()
+                elif job['kind'] == 'list':
                     self.rows = result['questions']
                     self._populate()
                 elif job['kind'] == 'copy':
@@ -316,12 +386,32 @@ class ReviewPanel(QWidget):
                         self.detail.update(correction_note=result['correction_note'],
                                            corrected_answer=result['corrected_answer'])
                         self._render_detail()
+                    batch = self.correction_batch
+                    if batch and batch.get('waiting') and batch['waiting']['key'] == result['key']:
+                        waiting = batch['waiting']
+                        if job['payload'] == waiting['values']:
+                            batch['position'] += 1
+                            batch['waiting'] = None
+                            self._next_correction_batch()
                 else:
                     item = self.question_list.currentItem()
                     if item and item.data(Qt.ItemDataRole.UserRole)['key'] == result['key']:
                         self._show_detail(result)
             except (OSError, ValueError, KeyError, TypeError) as exc:
+                if job['kind'] == 'save':
+                    row = next((r for r in self.rows if r['order'] == job['order']), None)
+                    if row and self.correction_drafts.get(row['key']) == job['payload']:
+                        self.correction_dirty.add(row['key'])
+                    if self.import_pending:
+                        self.queue = [j for j in self.queue if j['kind'] != 'import']
+                        self.import_pending = False
+                        self.apiBusyChanged.emit(self.is_busy())
+                if self.correction_batch and job['kind'] in {'plan', 'save'}:
+                    self._pause_correction_batch(f'批量纠错已暂停：{exc}', True)
                 self.statusChanged.emit(f'读取复习资料失败：{exc}', True)
+        if job['kind'] == 'import':
+            self.import_pending = False
+            self.apiBusyChanged.emit(self.is_busy())
         self._next_job()
         self._buttons()
 
@@ -440,6 +530,7 @@ class ReviewPanel(QWidget):
                                        'answer': self.correction_answer.toPlainText()}
         self.correction_dirty.add(key)
         self.correction_timer.start()
+        self._render_detail()
         self._buttons()
 
     def _save_current(self):
@@ -484,7 +575,7 @@ class ReviewPanel(QWidget):
         self._save_current()
         self.statusChanged.emit('正在准备第 %s 题的%s…' % (
             row['order'], '题目图片' if kind == 'image' else '纠错提示词'), False)
-        self._enqueue(kind, row['order'], payload=values if kind == 'prompt' else None)
+        self._enqueue(kind, row['order'], payload=values)
 
     def sync_api_options(self):
         if self.api_context is None:
@@ -502,6 +593,8 @@ class ReviewPanel(QWidget):
         for label, value in context['efforts']:
             self.review_reasoning_combo.addItem(label, value)
         self.review_reasoning_combo.setCurrentIndex(max(0, self.review_reasoning_combo.findData(effort)))
+        self.review_reasoning_hint.setText(context.get('reasoning_hint', '档位待查询'))
+        self.review_reasoning_combo.setToolTip(context.get('reasoning_tooltip', ''))
         self._buttons()
 
     def _review_profile_changed(self):
@@ -512,7 +605,107 @@ class ReviewPanel(QWidget):
                 combo.setCurrentIndex(index)
         self._buttons()
 
+    def is_busy(self):
+        return bool(self.api_job or self.import_pending or
+                    self.correction_batch and self.correction_batch['running'])
+
+    def import_official_results(self):
+        if self.is_busy() or not self.export_dir or self.api_context and self.api_context().get('batch_running'):
+            return
+        path = self.result_path.text().strip().strip('"')
+        if not path:
+            path, _ = QFileDialog.getOpenFileName(self, '打开已批阅结果文档', '', '网页归档 (*.mhtml *.mht)')
+        if not path:
+            return
+        self.result_path.setText(path)
+        self._save_dirty()
+        self.import_pending = True
+        self.apiBusyChanged.emit(True)
+        self.statusChanged.emit('正在读取结果文档、匹配错题和提取官方简析…', False)
+        self._enqueue('import', payload={'archive': path})
+        self._buttons()
+
+    def _batch_message(self, text, error=False):
+        self.correction_bulk_label.setText(text)
+        batch = self.correction_batch
+        if batch:
+            self.correction_bulk_progress.show()
+            total = len(batch['items'])
+            self.correction_bulk_progress.setRange(0, total if not batch.get('planning') else 0)
+            self.correction_bulk_progress.setValue(batch['position'])
+        self.statusChanged.emit(text, error)
+
+    def _pause_correction_batch(self, text, error=False):
+        if self.correction_batch:
+            self.correction_batch['running'] = False
+        self._batch_message(text, error)
+        self.apiBusyChanged.emit(self.is_busy())
+        self._buttons()
+
+    def start_bulk_correction_api(self):
+        batch = self.correction_batch
+        if batch and batch['running']:
+            batch['running'] = False
+            if self.api_job:
+                self.api_job['cancelled'] = True
+                self.api_process.kill()
+            self._pause_correction_batch('批量纠错已停止，已保存结果保留，可继续。')
+            return
+        if self.api_job or self.import_pending or not self.export_dir or not self.api_context:
+            return
+        context = self.api_context()
+        if context.get('batch_running') or not self.review_api_combo.currentData():
+            return
+        self._save_dirty()
+        if batch is None:
+            batch = self.correction_batch = {'running': True, 'items': [], 'position': 0,
+                'waiting': None, 'planning': True, 'source': self.export_dir,
+                'profile': self.review_api_combo.currentData(), 'effort': self.review_reasoning_combo.currentData(),
+                'parameter': context['parameter'], 'config': context['config']}
+        else:
+            batch['running'] = True
+        self.apiBusyChanged.emit(True)
+        if batch.get('planning'):
+            self._batch_message('正在检查所有已填写纠错建议的题目…')
+            if not any(j['kind'] == 'plan' for j in ([self.job] if self.job else [])+self.queue):
+                self._enqueue('plan')
+        else:
+            self._next_correction_batch()
+        self._buttons()
+
+    def _next_correction_batch(self):
+        batch = self.correction_batch
+        if not batch or not batch['running'] or self.api_job:
+            return
+        waiting = batch.get('waiting')
+        if waiting:
+            self._batch_message(f'正在重试保存第 {waiting["order"]} 题，不重复请求 API…')
+            pending = ([self.job] if self.job else [])+self.queue
+            if not any(j['kind'] == 'save' and j['order'] == waiting['order']
+                       and j['payload'] == waiting['values'] for j in pending):
+                self._enqueue('save', waiting['order'], payload=waiting['values'].copy())
+            return
+        if batch['position'] >= len(batch['items']):
+            count = batch['position']
+            self._batch_message(f'批量纠错完成，已保存 {count} 题。' if count else '没有填写纠错建议的题目。')
+            self.correction_batch = None
+            self.apiBusyChanged.emit(False)
+            self._buttons()
+            return
+        item = batch['items'][batch['position']]
+        values = self.correction_drafts.setdefault(item['key'], {'note': item['note'], 'answer': item['answer']})
+        if not values['note'].strip():
+            batch['position'] += 1
+            QTimer.singleShot(0, self._next_correction_batch)
+            return
+        request = {k: batch[k] for k in ('source', 'profile', 'effort', 'parameter', 'config')}
+        request.update(key=item['key'], order=item['order'], values=values.copy(), bulk=True)
+        self._batch_message(f'批量纠错 {batch["position"]+1}/{len(batch["items"])} · 第 {item["order"]} 题…')
+        self._launch_correction_api(request)
+
     def start_correction_api(self):
+        if self.import_pending or self.correction_batch and self.correction_batch['running']:
+            return
         if self.api_job:
             self.api_job['cancelled'] = True
             self.api_process.kill()
@@ -536,7 +729,10 @@ class ReviewPanel(QWidget):
         self._launch_correction_api(request)
 
     def retry_correction_api(self):
-        if self.api_context and self.api_context().get('batch_running'):
+        if self.is_busy() or self.api_context and self.api_context().get('batch_running'):
+            return
+        if self.correction_batch and self.last_api_request and self.last_api_request.get('bulk'):
+            self.start_bulk_correction_api()
             return
         if (self.api_job is None and self.last_api_request and
                 self.last_api_request['source'] == self.export_dir and
@@ -602,6 +798,8 @@ class ReviewPanel(QWidget):
             job['result'] = event
         elif kind == 'error':
             job['error'] = event.get('message', '')
+        elif kind == 'reasoning':
+            self.statusChanged.emit(f'第 {job["order"]} 题模型正在思考 · 已返回约 {event.get("count", 0)} 字符…', False)
         elif kind == 'status':
             self.statusChanged.emit(event.get('message', ''), False)
 
@@ -610,7 +808,7 @@ class ReviewPanel(QWidget):
             return
         self._read_api()
         job, self.api_job = self.api_job, None
-        self.apiBusyChanged.emit(False)
+        self.apiBusyChanged.emit(self.is_busy())
         job['input'].unlink(missing_ok=True)
         result = job['result']
         valid = (not code and status == QProcess.ExitStatus.NormalExit and result
@@ -620,6 +818,9 @@ class ReviewPanel(QWidget):
             self._load_correction(job['key'])
         if valid:
             self.correction_dirty.add(job['key'])
+            if job.get('bulk') and self.correction_batch:
+                self.correction_batch['waiting'] = {'key': job['key'], 'order': job['order'],
+                    'values': self.correction_drafts[job['key']].copy()}
             self._enqueue('save', job['order'], payload=self.correction_drafts[job['key']].copy())
             self.correction_dirty.discard(job['key'])
             self.statusChanged.emit(f'第 {job["order"]} 题修正答案已返回，正在保存。', False)
@@ -628,6 +829,10 @@ class ReviewPanel(QWidget):
         else:
             reason = job['error'] or (result or {}).get('message', '请求没有返回完整答案')
             self.statusChanged.emit(f'纠错 API 未保存：{reason}', True)
+        if not valid and job.get('bulk'):
+            message = ('批量纠错已停止，可继续重试当前题。' if job['cancelled'] else
+                       f'批量纠错已暂停：{reason}；可继续重试当前题。')
+            self._pause_correction_batch(message, not job['cancelled'])
         self._buttons()
 
     def _move(self, offset):
@@ -644,20 +849,30 @@ class ReviewPanel(QWidget):
         occupied = self.api_job is not None and self.api_job['key'] == key
         batch_running = bool(self.api_context and self.review_api_combo.count()
                              and self.api_context().get('batch_running'))
+        own_batch = bool(self.correction_batch and self.correction_batch['running'])
+        locked = own_batch or self.import_pending
+        self.import_results_button.setEnabled(bool(self.export_dir and not self.is_busy() and not batch_running))
+        self.result_path.setEnabled(not self.is_busy())
+        self.bulk_correction_api_button.setText('停止批量调用' if own_batch else
+            '继续批量调用' if self.correction_batch else '为所有需要修改的题依次调用API')
+        self.bulk_correction_api_button.setEnabled(own_batch or bool(self.export_dir and not self.is_busy()
+            and not batch_running and self.review_api_combo.currentData()))
         self.correction_note.setEnabled(key is not None)
-        self.correction_note.setReadOnly(occupied)
+        waiting = self.correction_batch.get('waiting') if self.correction_batch else None
+        saving = bool(waiting and waiting['key'] == key)
+        self.correction_note.setReadOnly(occupied or locked or saving)
         self.correction_answer.setEnabled(key is not None)
-        self.correction_answer.setReadOnly(occupied)
-        self.copy_image_button.setEnabled(key is not None)
-        self.copy_correction_prompt_button.setEnabled(key is not None)
-        self.review_api_combo.setEnabled(not batch_running and self.api_job is None and bool(self.review_api_combo.count()))
-        self.review_reasoning_combo.setEnabled(not batch_running and self.api_job is None and bool(self.review_reasoning_combo.count()))
-        self.retry_review_reasoning_button.setEnabled(not batch_running and self.api_job is None and
+        self.correction_answer.setReadOnly(occupied or locked or saving)
+        self.copy_image_button.setEnabled(key is not None and not self.import_pending)
+        self.copy_correction_prompt_button.setEnabled(key is not None and not self.import_pending)
+        self.review_api_combo.setEnabled(not locked and not batch_running and self.api_job is None and bool(self.review_api_combo.count()))
+        self.review_reasoning_combo.setEnabled(not locked and not batch_running and self.api_job is None and bool(self.review_reasoning_combo.count()))
+        self.retry_review_reasoning_button.setEnabled(not locked and not batch_running and self.api_job is None and
             self.review_api_combo.currentData() is not None)
         self.call_correction_api_button.setText('停止请求' if self.api_job else '直接调用 API')
-        self.call_correction_api_button.setEnabled(not batch_running and bool(self.api_job or
+        self.call_correction_api_button.setEnabled(not locked and not saving and not batch_running and bool(self.api_job or
             (key and self.review_api_combo.currentData() and self.correction_note.text().strip())))
-        self.retry_correction_api_button.setEnabled(bool(not batch_running and not self.api_job and self.last_api_request and
+        self.retry_correction_api_button.setEnabled(bool(not locked and not batch_running and not self.api_job and self.last_api_request and
             self.last_api_request['source'] == self.export_dir and
             self.last_api_request['key'] in self.correction_drafts))
 
@@ -667,6 +882,8 @@ class ReviewPanel(QWidget):
             self._enqueue('copy', self.detail['order'])
 
     def shutdown(self):
+        if self.correction_batch:
+            self.correction_batch['running'] = False
         self._save_dirty()
         saves = [job for job in ([self.job] if self.job else [])+self.queue if job['kind'] == 'save']
         if self.api_process.state() != QProcess.ProcessState.NotRunning:

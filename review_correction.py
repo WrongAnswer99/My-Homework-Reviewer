@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import uuid
@@ -11,7 +12,8 @@ from pathlib import Path
 from answers_homework import load_questions, parse_answers
 from api_config import DEFAULT_CONFIG, load_profiles, normalize_profile
 from api_homework import API_PREFIX, build_payload, emit, request_answers
-from render_homework import BrowserRenderer, batch_html, group_questions
+from render_homework import BrowserRenderer, batch_html, group_questions, rich_text
+from official_correction import correction_plan, import_results
 from review_homework import question_detail, question_text, save_correction
 from prompt_config import FORMULA_GUIDANCE
 
@@ -41,19 +43,24 @@ def correction_prompt(source, order, note, previous_answer):
             f'**检查**\n\n（条件和结果核对）\n\n【结束 {key}】\n')
 
 
-def question_image(source, order, width=1280):
+def question_image(source, order, width=1280, note=''):
     source, report, rows, _ = load_questions(source)
     if not 1 <= order <= len(rows):
         raise ValueError('题目序号超出范围')
-    output = source.parent/'review_images'/f'question_{order:04d}.png'
+    suffix = '_'+hashlib.sha256(note.encode('utf-8')).hexdigest()[:16] if note.strip() else ''
+    output = source.parent/'review_images'/f'question_{order:04d}{suffix}.png'
     if output.is_file():
         return output
     output.parent.mkdir(parents=True, exist_ok=True)
     group = group_questions(report, 1)[order-1]
     temporary = output.with_name('.'+uuid.uuid4().hex+'.png')
     try:
+        content = batch_html(report, group, source.parent, {})
+        if note.strip():
+            feedback = '<article><h3>官方答案与解析</h3>'+rich_text(note, source.parent, {})+'</article>'
+            content = content.replace('</main>', feedback+'</main>')
         with BrowserRenderer(width) as renderer:
-            renderer.capture(batch_html(report, group, source.parent, {}), temporary)
+            renderer.capture(content, temporary)
         temporary.replace(output)
     finally:
         temporary.unlink(missing_ok=True)
@@ -69,9 +76,9 @@ def read_input(path):
 
 def main():
     parser = argparse.ArgumentParser(description='单题纠错与修正解答')
-    parser.add_argument('command', choices=('prompt', 'image', 'save', 'api'))
+    parser.add_argument('command', choices=('prompt', 'image', 'save', 'api', 'import', 'plan'))
     parser.add_argument('source', type=Path)
-    parser.add_argument('--order', type=int, required=True)
+    parser.add_argument('--order', type=int, default=1)
     parser.add_argument('--input', type=Path)
     parser.add_argument('--config', type=Path, default=DEFAULT_CONFIG)
     parser.add_argument('--profile')
@@ -81,8 +88,17 @@ def main():
     args = parser.parse_args()
     profile = None
     try:
+        if args.command == 'import':
+            values = json.loads(args.input.read_text(encoding='utf-8'))
+            print(json.dumps(import_results(args.source, values['archive']), ensure_ascii=False))
+            return 0
+        if args.command == 'plan':
+            print(json.dumps(correction_plan(args.source), ensure_ascii=False))
+            return 0
         if args.command == 'image':
-            print(json.dumps({'image': str(question_image(args.source, args.order))}, ensure_ascii=False))
+            values = read_input(args.input) if args.input else {'note': ''}
+            print(json.dumps({'image': str(question_image(args.source, args.order, note=values['note']))},
+                             ensure_ascii=False))
             return 0
         if args.input is None:
             raise ValueError('请提供纠错信息')
@@ -102,7 +118,9 @@ def main():
         if profile is None:
             raise ValueError('请先选择 API 配置')
         profile = normalize_profile(profile, require_ready=True)
-        image = question_image(args.source, args.order) if profile['send_image'] else None
+        # Include official diagrams in the same visual input as the question.
+        image_note = values['note'] if '![' in values['note'] else ''
+        image = question_image(args.source, args.order, note=image_note) if profile['send_image'] else None
         emit({'type': 'status', 'message': f'正在请求 {profile["name"]} 修正第 {args.order} 题…'})
         payload, keys = build_payload(profile, args.source, args.order, args.order, image,
                                       args.reasoning_effort, args.reasoning_parameter,

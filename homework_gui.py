@@ -630,12 +630,12 @@ class HomeworkWindow(QMainWindow):
         panel = self.tabs.widget(index)
         if panel not in (self.review_panel, self.correction_panel):
             return
-        if panel.active and panel.export_dir is not None and panel.api_job is None:
+        if panel.active and panel.export_dir is not None and not panel.is_busy():
             panel.set_export(panel.export_dir, refresh=True)
         panel.activate()
 
     def _begin_rename(self):
-        if self.source is None or self.job is not None or self.correction_panel.api_job is not None or self._bulk_running():
+        if self.source is None or self.job is not None or self.correction_panel.is_busy() or self._bulk_running():
             return
         self.rename_input.setText(self.source.stem)
         self.title_label.hide()
@@ -658,7 +658,7 @@ class HomeworkWindow(QMainWindow):
         return entry.get('source_file') or self.source.name
 
     def _commit_rename(self):
-        if self.source is None or self.job is not None or self.correction_panel.api_job is not None or self._bulk_running():
+        if self.source is None or self.job is not None or self.correction_panel.is_busy() or self._bulk_running():
             return
         source = self.source
         base = self.rename_input.text().strip()
@@ -857,7 +857,7 @@ class HomeworkWindow(QMainWindow):
 
     def _update_buttons(self):
         bulk_running = self._bulk_running()
-        idle = self.job is None and self.correction_panel.api_job is None and not bulk_running
+        idle = self.job is None and not self.correction_panel.is_busy() and not bulk_running
         selected = self.source is not None
         for widget in (self.refresh_button, self.folder_button, self.file_list):
             widget.setEnabled(idle)
@@ -882,7 +882,7 @@ class HomeworkWindow(QMainWindow):
         self.prompt_template_combo.setEnabled(idle and bool(self.prompt_templates))
         self.prompt_settings_button.setEnabled(idle)
         self.open_study_button.setEnabled(idle and self.study_path is not None and self.study_path.is_file())
-        self.api_config_button.setEnabled(not api_running and not bulk_running)
+        self.api_config_button.setEnabled(not api_running and not bulk_running and not self.correction_panel.is_busy())
         self.api_combo.setEnabled(idle and bool(self.api_profiles))
         self.reasoning_combo.setEnabled(idle and bool(self.api_profiles))
         self.retry_reasoning_button.setEnabled(idle and self.api_combo.currentData() is not None)
@@ -930,7 +930,9 @@ class HomeworkWindow(QMainWindow):
                             for i in range(self.reasoning_combo.count())],
                 'effort': self.reasoning_combo.currentData(),
                 'parameter': self.reasoning_parameter, 'config': self.api_config_path,
-                'batch_running': self._bulk_running() or bool(self.job and self.job.get('bulk_position') is not None)}
+                'reasoning_hint': self.reasoning_hint.text(),
+                'reasoning_tooltip': self.reasoning_combo.toolTip(),
+                'batch_running': self._bulk_running() or self.job is not None}
 
     def _api_selection_changed(self, *args):
         self.reasoning_combo.setCurrentIndex(0)
@@ -954,10 +956,14 @@ class HomeworkWindow(QMainWindow):
         profile_id = self.api_combo.currentData()
         if not profile_id:
             self.reasoning_hint.setText('未配置')
+            self.correction_panel.sync_api_options()
+            self._status('未配置 API，无法获取思考强度。', True)
             return
         self.reasoning_hint.setText('查询档位中…')
         self.reasoning_combo.setToolTip('正在查询模型目录'+('并按需进行最小探测' if allow_probe else '')+
                                        '；查询期间可以手动选择思考强度。')
+        self.correction_panel.sync_api_options()
+        self._status('正在获取思考强度…')
         process = QProcess(self)
         self.reasoning_process = process
         process.finished.connect(lambda code, status, p=process, key=profile_id:
@@ -975,6 +981,8 @@ class HomeworkWindow(QMainWindow):
             self.reasoning_process = None
             self.reasoning_hint.setText('档位未提供')
             self.reasoning_combo.setToolTip('模型信息查询进程未能启动；可以手动选择思考强度。')
+            self.correction_panel.sync_api_options()
+            self._status('获取思考强度失败：模型信息查询进程未能启动。', True)
             process.deleteLater()
 
     def _reasoning_info_finished(self, process, profile_id, code, status):
@@ -1001,16 +1009,19 @@ class HomeworkWindow(QMainWindow):
                 self.reasoning_combo.setCurrentIndex(max(0, self.reasoning_combo.findData(selected_effort)))
                 self.reasoning_combo.blockSignals(False)
                 self.reasoning_hint.setText(f'{len(levels)} 档可选')
+                self._status(f'获取思考强度成功：{len(levels)} 档可选。')
             elif result.get('status') == 'blocked':
                 self.reasoning_hint.setText('服务商拦截查询')
                 self._status(f'获取思考强度失败：{result.get("message", "服务商拒绝访问")}', True)
             else:
                 self.reasoning_hint.setText('档位未提供')
+                self._status('思考强度查询完成：'+result.get('message', '接口未提供档位，可手动选择。'))
             self.reasoning_combo.setToolTip(result.get('message', '模型接口未提供思考强度信息')+
                                             '；可选“默认”沿用服务端设置。')
         except (ValueError, UnicodeError, TypeError) as exc:
             self.reasoning_hint.setText('档位未提供')
             self.reasoning_combo.setToolTip(f'{exc}；可手动选择思考强度。')
+            self._status(f'获取思考强度失败：{exc}；可手动选择。', True)
         finally:
             if process is self.reasoning_process:
                 self.reasoning_process = None
@@ -1104,7 +1115,7 @@ class HomeworkWindow(QMainWindow):
                 self.job['cancelled'] = True
                 self.process.kill()
             return
-        if self.job or self.source is None or self.correction_panel.api_job is not None:
+        if self.job or self.source is None or self.correction_panel.is_busy():
             return
         try:
             profile = next((p for p in load_profiles(self.api_config_path)
@@ -1134,7 +1145,7 @@ class HomeworkWindow(QMainWindow):
         QTimer.singleShot(0, self._advance_bulk)
 
     def _advance_bulk(self):
-        if not self._bulk_running() or self.job or self.correction_panel.api_job is not None:
+        if not self._bulk_running() or self.job or self.correction_panel.is_busy():
             return
         task = self.bulk_task
         if self.source != task['source']:
@@ -1187,7 +1198,7 @@ class HomeworkWindow(QMainWindow):
                             [self.export_dir, '--manifest', self.render_dir/'manifest.json'])
 
     def start_api(self):
-        if self._bulk_running():
+        if self._bulk_running() or self.correction_panel.is_busy():
             return
         if self.job:
             if self.job['kind'] == 'api':
@@ -1211,7 +1222,7 @@ class HomeworkWindow(QMainWindow):
         self._launch_api(request)
 
     def retry_api(self):
-        if self._bulk_running():
+        if self._bulk_running() or self.correction_panel.is_busy():
             return
         request = self.last_api_request
         if self.job is None and request is not None and self.export_dir == request['export_dir']:

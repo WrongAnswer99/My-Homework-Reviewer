@@ -107,6 +107,31 @@ class CorrectionTests(unittest.TestCase):
         self.assertTrue(content[1]['image_url']['url'].startswith('data:image/png;base64,'))
         self.assertNotIn('TEST-KEY-ONLY', run.stdout+run.stderr)
 
+    def test_official_diagram_is_in_the_image_sent_to_api(self):
+        import base64
+        import io
+        values = {'note': '官方正确答案：A\n\n官方简析 ![说明](images/circuit.png)', 'answer': ''}
+        input_file = self.folder/'input.json'
+        input_file.write_text(json.dumps(values, ensure_ascii=False), encoding='utf-8')
+        profile = new_profile()
+        profile.update(name='测试模型', model='mock-vision', api_key='TEST-KEY-ONLY')
+        config = self.folder/'api_config.json'
+        response = block(self.rows[0], '**结论**\n\nA')
+        with api_server(sse(response), 'text/event-stream') as (url, requests):
+            save_profiles(config, [dict(profile, base_url=url)])
+            run = subprocess.run([sys.executable, '-B', '-X', 'utf8', str(ROOT/'review_correction.py'),
+                                  'api', str(self.folder), '--order', '1', '--input', str(input_file),
+                                  '--config', str(config), '--profile', profile['id']],
+                                 capture_output=True, text=True, encoding='utf-8', timeout=30)
+        self.assertEqual(run.returncode, 0, run.stdout+'\n'+run.stderr)
+        image = next((self.folder/'review_images').glob('question_0001_*.png'))
+        content = requests[0]['body']['messages'][-1]['content']
+        sent = base64.b64decode(content[1]['image_url']['url'].split(',', 1)[1])
+        self.assertEqual(sent, image.read_bytes())
+        with Image.open(io.BytesIO(sent)) as rendered:
+            self.assertGreater(rendered.height, 100)
+        self.assertIn('官方简析', content[0]['text'])
+
 
 if __name__ == '__main__':
     unittest.main()
