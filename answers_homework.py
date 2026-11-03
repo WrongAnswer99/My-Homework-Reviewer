@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from prompt_config import ANALOG_PROMPT, FORMULA_GUIDANCE, add_prompt_arguments, resolve_prompt
+from question_metadata import graded_answer_note
 
 sys.dont_write_bytecode = True
 
@@ -172,6 +173,9 @@ def build_document(report, rows, answers):
             lines += [f'填空数量：{question["blank_count"]}。', '']
         if question.get('displayed_type'):
             lines += [f'> 原页面标注：{question["displayed_type"]}。', '']
+        note = graded_answer_note(question, markdown=True)
+        if note:
+            lines += [note, '']
         lines += ['#### AI 解答', '', answer_headings(answers[row['key']])
                   if row['key'] in answers else '*尚未导入解答。*', '']
     if report.get('warnings'):

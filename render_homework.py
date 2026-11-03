@@ -19,6 +19,7 @@ sys.dont_write_bytecode = True
 import markdown
 from PIL import Image
 from cli_progress import print_progress, update_progress
+from question_metadata import graded_answer_note
 
 
 CSS = """
@@ -163,6 +164,9 @@ def batch_html(report, group, directory, image_cache):
                          f'{rich_text(option["text"], directory, image_cache)}</div></div>')
         if q.get('blank_count'):
             parts.append(f'<p class="blanks">填空数量：{int(q["blank_count"])}</p>')
+        note = graded_answer_note(q)
+        if note:
+            parts.append(f'<p class="graded-answer">{escape(note)}</p>')
         context = f'{entry["title"]} 第 {q["number"]} 题：'
         for warning in report.get('warnings', []):
             if warning.startswith(context):

@@ -25,6 +25,7 @@ from fontTools.ttLib import TTLibError
 sys.dont_write_bytecode = True
 from ocr.question_ocr import QuestionOCR
 from cli_progress import print_progress, update_progress
+from question_metadata import graded_answer_note
 
 
 @dataclass
@@ -141,9 +142,12 @@ def page_font(root, archive, base):
             expects_font = expects_font or 'work-css-tpl' in n.attrs.get('href', '')
             part = archive.resolve(n.attrs.get('href', ''), base)
             if part is not None:
+                expects_font = expects_font or 'work-css-tpl' in str(part.get('Content-Location', ''))
                 styles.append(decode_text(part))
     selected = None
     for css in styles:
+        expects_font = expects_font or bool(re.search(
+            r'font-family\s*:\s*["\']?font-cxsecret\b', css, re.I))
         for rule in re.findall(r'@font-face\s*\{([^}]+)\}', css, re.I):
             if 'font-cxsecret' not in rule:
                 continue
@@ -305,6 +309,28 @@ class Renderer:
                              for piece in pieces))
 
 
+def graded_answer(node):
+    """Read only the student's answer and explicit grading icons, not official answers."""
+    box = node.find_class('myAnswerBx')
+    if box is None:
+        return {}
+    answer_node = box.find_class('myAnswer')
+    status_node = box.find_class('CorrectOrNot')
+    if answer_node is None or status_node is None:
+        return {}
+    statuses = {status for item in status_node.walk()
+                for name, status in [('marking_dui', 'correct'), ('marking_cuo', 'incorrect'),
+                                     ('marking_bandui', 'partial')]
+                if item.has_class(name)}
+    if len(statuses) != 1:
+        return {}
+    body = answer_node.find_class('answerCon')
+    if body is None:
+        return {}
+    answer = ' '.join(clean(body.text()).split())
+    return {'student_answer': answer, 'grading': statuses.pop()}
+
+
 def _extract(source: Path, output: Path, resolver, progress=None):
     update_progress(progress, 'read', f'正在读取 {source.name}…')
     archive = Archive(source)
@@ -402,16 +428,29 @@ def _extract(source: Path, output: Path, resolver, progress=None):
                     label = next((n for n in li.walk() if n.has_class('num_option')
                                   or n.has_class('num_option_dx')), None)
                     body = li.find_class('after')
+                    # Graded homework uses <i>A、</i><a>...</a> instead of
+                    # the editor's num_option/after classes.
+                    if label is None:
+                        label = next((n for n in li.children if isinstance(n, Node)
+                                      and n.tag == 'i' and re.fullmatch(
+                                          r'[A-Za-z][、.．]?', clean(n.text()))), None)
+                    if body is None:
+                        body = next((n for n in li.children
+                                     if isinstance(n, Node) and n.tag == 'a'), None)
                     if label is not None and body is not None:
                         # Visible labels follow the shuffled display order. data/ARIA
                         # contain the original option IDs and must not be used as labels.
-                        option_nodes.append((clean(label.text()), body, li.has_class('font-cxsecret')))
+                        option_nodes.append((clean(label.text()).rstrip('、.．'), body,
+                                             li.has_class('font-cxsecret')))
             groups = [renderer.ocr_pieces(stem_node, base, '题干：')]
             groups.extend(renderer.ocr_pieces(body, base, f'选项{label}：', secret)
                           for label, body, secret in option_nodes)
             pieces = [piece for group in groups for piece in group]
             for piece in pieces:
-                if blob is not None and 'runs' in piece:
+                if 'runs' in piece:
+                    # Graded pages retain the class even for ordinary plaintext.
+                    # page_font already rejects declared but missing secret fonts;
+                    # a class alone does not mean these characters are encrypted.
                     piece['encrypted'] = any(secret and ord(char) in supported
                                              for text, secret in piece['runs'] for char in text)
             needs_ocr = any(piece.get('encrypted') for piece in pieces)
@@ -444,6 +483,7 @@ def _extract(source: Path, output: Path, resolver, progress=None):
             seen.add(key)
             question = {'id': qid, 'number': number, 'type': qtype,
                         'stem': stem, 'options': options}
+            question.update(graded_answer(node))
             if ocr_image:
                 question['ocr_image'] = ocr_image
             if blank_count:
@@ -472,6 +512,9 @@ def _extract(source: Path, output: Path, resolver, progress=None):
                 lines.extend([f'填空数量：{question["blank_count"]}。', ''])
             for option in question['options']:
                 lines.extend([f'- **{option["label"]}.** ' + option['text'].replace('\n', '\n  '), ''])
+            note = graded_answer_note(question, markdown=True)
+            if note:
+                lines.extend([note, ''])
     if renderer.warnings:
         lines.extend(['## 导出提示', ''])
         lines.extend('- ' + w for w in dict.fromkeys(renderer.warnings))

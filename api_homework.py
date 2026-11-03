@@ -11,6 +11,7 @@ from http.client import HTTPException
 from pathlib import Path
 
 from answers_homework import load_questions, make_prompt, parse_answers
+from question_metadata import graded_answer_note
 from api_config import DEFAULT_CONFIG, load_profiles, normalize_profile
 from prompt_config import add_prompt_arguments, resolve_prompt
 from api_transport import APIConnectionError, APIStatusError, APITimeoutError, HTTPError, TimeoutException, create_client
@@ -46,6 +47,9 @@ def build_payload(profile, source, first, last, image=None, reasoning_effort=Non
         text += [f'{option["label"]}. {option["text"]}' for option in question.get('options', [])]
         if question.get('blank_count'):
             text.append(f'填空数量：{question["blank_count"]}')
+        note = graded_answer_note(question)
+        if note:
+            text.append(note)
     message_text = (prompt if prompt_override is not None else
                     prompt+'\n题目文字（图中文字以题图为准）：\n'+'\n\n'.join(text))
     content = [{'type': 'text', 'text': message_text}]

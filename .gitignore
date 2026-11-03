@@ -40,6 +40,7 @@ dist/
 /exports/
 *.mhtml
 *.mht
+*.pdf
 
 # Local editor settings and operating-system files
 .vscode/

@@ -11,6 +11,7 @@ from urllib.parse import unquote, urlsplit
 sys.dont_write_bytecode = True
 
 from answers_homework import atomic_write, load_questions, load_store
+from question_metadata import graded_answer_note
 
 IMAGE = re.compile(r'!\[[^\n]*?\]\(([^\n)]+)\)')
 CONCLUSION = re.compile(r'^\s*(?:#{1,6}\s*)?(?:(?:\*\*|__)\s*结论\s*(?:\*\*|__)|结论)\s*(?:[:：]\s*(.*))?\s*$')
@@ -65,6 +66,9 @@ def question_text(row):
         lines += [f'- **{option["label"]}.** {option["text"]}', '']
     if q.get('blank_count'):
         lines += [f'填空数量：{q["blank_count"]}。', '']
+    note = graded_answer_note(q, markdown=True)
+    if note:
+        lines += [note, '']
     return '\n'.join(lines)
 
 

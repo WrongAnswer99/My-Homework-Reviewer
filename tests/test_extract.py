@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from email.message import EmailMessage
+from email.parser import BytesParser
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -42,6 +43,119 @@ def question(stem, options=''):
 
 
 class ExtractionTests(unittest.TestCase):
+    def test_graded_homework_plaintext_with_secret_class_and_legacy_options(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as temp:
+            source, output = Path(temp)/'test.mhtml', Path(temp)/'result'
+            html = question('当电阻与感抗串联时，相位差为多少？', '''
+                <li class="clearfix" role="option"><i class="fl">A、</i>
+                  <a class="fl">-30°</a></li>
+                <li class="clearfix" role="option"><i class="fl">B、</i>
+                  <a class="fl"><img src="cid:formula"></a></li>''')
+            html = html.replace('class="fontLabel"', 'class="font-cxsecret fontLabel"')
+            html += '<div class="correctAnswer">正确答案：B</div>'
+            archive(source, html, [('formula', 'image/png', b'formula-image')])
+            report = extract(source, output, resolver=SimpleNamespace(model='unused', question_count=0))
+            q = report['assignments'][0]['questions'][0]
+            self.assertEqual(q['stem'], '当电阻与感抗串联时，相位差为多少？')
+            self.assertEqual([o['label'] for o in q['options']], ['A', 'B'])
+            self.assertEqual(q['options'][0]['text'], '-30°')
+            self.assertIn('![题图](images/', q['options'][1]['text'])
+            self.assertEqual(report['image_count'], 1)
+            self.assertEqual(report['ocr']['question_images'], 0)
+            self.assertEqual(report['warnings'], [])
+            self.assertNotIn('正确答案', (output/'questions.md').read_text(encoding='utf-8'))
+
+    def test_graded_homework_exports_student_answer_and_explicit_result(self):
+        cases = [('marking_dui', 'A', 'correct', '我的答案：A，该题正确。'),
+                 ('marking_cuo', 'B', 'incorrect', '我的答案：B，该题错误。'),
+                 ('marking_bandui', 'AC', 'partial', '我的答案：AC，该题部分正确。'),
+                 ('marking_cuo', '', 'incorrect', '我的答案：未作答，该题错误。'),
+                 ('', 'D', None, None)]
+        for icon, answer, grading, note in cases:
+            with self.subTest(icon=icon, answer=answer), tempfile.TemporaryDirectory(dir=ROOT) as temp:
+                source, output = Path(temp)/'test.mhtml', Path(temp)/'result'
+                feedback = f'''<div class="myAnswerBx">
+                  <div class="myAnswer"><span>我的答案：</span>
+                    <div class="answerCon">{answer}</div></div>
+                  <div class="answerScore"><div class="CorrectOrNot">
+                    <span class="{icon}"></span></div><span>2.5分</span></div></div>
+                  <div class="correctAnswer"><div class="answerCon">D</div></div>'''
+                html = question('测试题干', '<li><i>A、</i><a>测试选项</a></li>')
+                html = html.replace('</ul></div>', '</ul>' + feedback + '</div>')
+                archive(source, html)
+                report = extract(source, output, resolver=SimpleNamespace(model='unused', question_count=0))
+                q = report['assignments'][0]['questions'][0]
+                markdown = (output/'questions.md').read_text(encoding='utf-8')
+                self.assertEqual(q['stem'], '测试题干')
+                if grading is None:
+                    self.assertNotIn('student_answer', q)
+                    self.assertNotIn('我的答案', markdown)
+                else:
+                    self.assertEqual(q['student_answer'], answer)
+                    self.assertEqual(q['grading'], grading)
+                    self.assertTrue(markdown.rstrip().endswith(note))
+                    self.assertGreater(markdown.index(note), markdown.index('测试选项'))
+                self.assertNotIn('正确答案', markdown)
+
+    def test_declared_missing_secret_font_still_fails(self):
+        styles = [
+            '<style>@font-face {font-family: font-cxsecret; src: url(missing.woff)}</style>',
+            '<style>.font-cxsecret {font-family: "font-cxsecret"}</style>',
+            '<link rel="stylesheet" href="/work-css-tpl/missing.css">',
+        ]
+        for style in styles:
+            with self.subTest(style=style), tempfile.TemporaryDirectory(dir=ROOT) as temp:
+                source, output = Path(temp)/'test.mhtml', Path(temp)/'result'
+                archive(source, style + question('不能忽略真正缺失的字体'))
+                with self.assertRaisesRegex(ValueError, '字体'):
+                    extract(source, output, resolver=SimpleNamespace(model='unused', question_count=0))
+                self.assertFalse(output.exists())
+                self.assertFalse(list(Path(temp).glob('.extract-*')))
+
+    def test_secret_font_stylesheet_location_is_checked_when_link_uses_cid(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as temp:
+            source, output = Path(temp)/'test.mhtml', Path(temp)/'result'
+            archive(source, '<link rel="stylesheet" href="cid:secret-css">' + question('题干'))
+            message = BytesParser().parsebytes(source.read_bytes())
+            part = EmailMessage()
+            part.set_content('/* font resource absent */', subtype='css')
+            part['Content-ID'] = '<secret-css>'
+            part['Content-Location'] = 'https://example.test/work-css-tpl/fonts.css'
+            message.attach(part)
+            source.write_bytes(message.as_bytes())
+            with self.assertRaisesRegex(ValueError, '缺少字体资源'):
+                extract(source, output, resolver=SimpleNamespace(model='unused', question_count=0))
+            self.assertFalse(output.exists())
+
+    def test_graded_homework_real_analog_chapter_one_archive(self):
+        source = ROOT/'模电第一章.mhtml'
+        if not source.exists():
+            self.skipTest('已批阅作业样例归档未提供')
+        with tempfile.TemporaryDirectory(dir=ROOT) as temp:
+            output = Path(temp)/'result'
+            report = extract(source, output, resolver=SimpleNamespace(model='unused', question_count=0))
+            self.assertEqual(report['assignments'][0]['title'], '电路分析复习自测')
+            self.assertEqual(report['question_count'], 40)
+            self.assertEqual(report['image_count'], 79)
+            self.assertEqual(report['warnings'], [])
+            questions = report['assignments'][0]['questions']
+            self.assertEqual([q['number'] for q in questions], [str(i) for i in range(1, 41)])
+            self.assertTrue(all(q['type'] == '单选题' for q in questions))
+            self.assertTrue(all([o['label'] for o in q['options']] == list('ABCD') for q in questions))
+            self.assertTrue(all(o['text'] for q in questions for o in q['options']))
+            self.assertIn('二端口网络的传输参数方程组', questions[0]['stem'])
+            self.assertEqual([o['text'] for o in questions[1]['options']], ['-30°', '60°', '-60°', '30°'])
+            self.assertEqual(report['ocr']['question_images'], 0)
+            markdown = (output/'questions.md').read_text(encoding='utf-8')
+            references = re.findall(r'!\[.*?\]\((images/[^)]+)\)', markdown)
+            self.assertGreater(len(references), 0)
+            self.assertTrue(all((output/ref).is_file() for ref in references))
+            self.assertNotIn('正确答案', markdown)
+            self.assertEqual([q['student_answer'] for q in questions[:2]], ['A', 'D'])
+            self.assertTrue(all(q['grading'] == 'correct' for q in questions))
+            self.assertEqual(markdown.count('我的答案：'), 40)
+            self.assertEqual(markdown.count('该题正确。'), 40)
+
     def test_new_homework_editor_choice_labels_and_content(self):
         for qtype, label_class, role in [('单选题', 'num_option', 'radio'),
                                          ('多选题', 'num_option_dx', 'checkbox')]:
@@ -79,6 +193,8 @@ class ExtractionTests(unittest.TestCase):
                 self.assertIn('- **B.** ![题图](images/', markdown)
                 self.assertNotIn('aria-checked', markdown)
                 self.assertNotIn('answer', q)
+                self.assertNotIn('student_answer', q)
+                self.assertNotIn('grading', q)
 
     def test_new_homework_editor_real_multiple_choice_questions(self):
         source = ROOT/'数电第二章1.mhtml'
